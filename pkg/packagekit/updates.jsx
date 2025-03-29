@@ -73,9 +73,10 @@ import { WithDialogs } from "dialogs.jsx";
 
 import { superuser } from 'superuser';
 import * as PK from "packagekit.js";
+import * as python from "python.js";
 import * as timeformat from "timeformat";
 
-import * as python from "python.js";
+import { debug } from './utils';
 import callTracerScript from './callTracer.py';
 
 import "./updates.scss";
@@ -485,7 +486,7 @@ class RestartServices extends React.Component {
                 return 1;
             return a.localeCompare(b);
         });
-        const restarts = daemons.map(service => cockpit.spawn(["systemctl", "restart", service + ".service"], { superuser: "required", err: "message" }));
+        const restarts = daemons.map(service => cockpit.spawn(["systemctl", "restart", service], { superuser: "required", err: "message" }));
         this.setState({ restartInProgress: true });
         Promise.all(restarts)
                 .then(() => {
@@ -498,7 +499,7 @@ class RestartServices extends React.Component {
                 .catch(ex => {
                     this.dialogErrorSet(_("Failed to restart service"), ex.message);
                     // see what services remain
-                    this.props.checkNeedsRestart(null);
+                    this.props.checkNeedsRestart();
                 });
     }
 
@@ -1010,6 +1011,7 @@ class OsUpdates extends React.Component {
         this.handleRefresh = this.handleRefresh.bind(this);
         this.loadUpdates = this.loadUpdates.bind(this);
         this.onValueChanged = this.onValueChanged.bind(this);
+        this.checkNeedsRestart = this.checkNeedsRestart.bind(this);
 
         superuser.addEventListener("changed", () => {
             this.setState({ privileged: superuser.allowed });
@@ -1025,7 +1027,7 @@ class OsUpdates extends React.Component {
 
     componentDidMount() {
         this._mounted = true;
-        this.checkNeedsRestart(null);
+        this.checkNeedsRestart();
 
         PK.getBackendName().then(([prop]) => this.setState({ backend: prop.v }));
 
@@ -1064,38 +1066,109 @@ class OsUpdates extends React.Component {
         this._mounted = false;
     }
 
-    checkNeedsRestart(state) {
+    checkNeedsRestart() {
         this.setState({ checkRestartRunning: true });
-        python.spawn(callTracerScript, null, { err: "message", superuser: "require" })
+        return python.spawn(callTracerScript, undefined, { err: "message", superuser: "require" })
                 .then(output => {
+                    debug("tracer succeeded, output:", output);
                     const restartPackages = JSON.parse(output);
                     // Filter out duplicates
                     restartPackages.reboot = [...new Set(shortenCockpitWsInstance(restartPackages.reboot))];
                     restartPackages.daemons = [...new Set(shortenCockpitWsInstance(restartPackages.daemons))];
                     restartPackages.manual = [...new Set(shortenCockpitWsInstance(restartPackages.manual))];
-                    const nextState = { checkRestartAvailable: true, checkRestartRunning: false, restartPackages };
-                    if (state)
-                        nextState.state = state;
-
-                    this.setState(nextState);
+                    debug("tracer parsed restartPackages:", JSON.stringify(restartPackages));
+                    this.setState({ checkRestartAvailable: true, checkRestartRunning: false, restartPackages });
                 })
                 .catch((exception, data) => {
-                    // common cases: this platform does not have tracer installed
-                    if (!exception.message?.includes("ModuleNotFoundError") &&
-                        // or supported (like on Arch)
-                        !exception.message?.includes("UnsupportedDistribution") &&
-                        // or polkit does not allow it
-                        exception.problem !== "access-denied" &&
+                    // tracer not installed or supported (like on Arch)? then fall back to dnf needs-restarting
+                    if (exception.message?.includes("ModuleNotFoundError") ||
+                        exception.message?.includes("UnsupportedDistribution")) {
+                        debug('tracer not installed:', JSON.stringify(exception), "trying dnf needs-restarting");
+                        return this.checkDnfNeedsRestarting();
+                    }
+
+                    // log the error except for some common cases: polkit does not allow it
+                    if (exception.problem !== "access-denied" &&
                         // or unprivileged session
                         exception.problem !== "authentication-failed" &&
                         // or the session goes away while checking
                         exception.problem !== "terminated")
                         console.error(`Tracer failed: "${JSON.stringify(exception)}", data: "${JSON.stringify(data)}"`);
+                    else
+                        debug('tracer failed for uninteresting reason:', JSON.stringify(exception));
+
                     // When tracer fails, act like it's not available (demand reboot after every update)
-                    const nextState = { checkRestartAvailable: false, checkRestartRunning: false, restartPackages: { reboot: [], daemons: [], manual: [] } };
-                    if (state)
-                        nextState.state = state;
-                    this.setState(nextState);
+                    this.setState({
+                        checkRestartAvailable: false,
+                        checkRestartRunning: false,
+                        restartPackages: { reboot: [], daemons: [], manual: [] },
+                    });
+                });
+    }
+
+    checkDnfNeedsRestarting() {
+        const restartPackages = { reboot: [], daemons: [], manual: [] };
+
+        // needs-restarting has no machine-readable API: https://issues.redhat.com/browse/RHEL-56139
+        // --exclude-services was added much later, so check that first
+        return cockpit.spawn(["dnf", "needs-restarting", "--exclude-services"], { err: "message", superuser: "require" })
+                .then(outManual => {
+                    debug("dnf needs-restarting --exclude-services succeeded:", outManual);
+                    // format: "pid : argv", e.g. "1234 : mydaemon 3600"
+                    outManual.trim()
+                            .split("\n")
+                            // HACK: https://issues.redhat.com/browse/RHEL-84657
+                            .filter(line => line.match(/^\d+ : /))
+                            .forEach(line => !line || restartPackages.manual.push(line));
+
+                    return Promise.allSettled([
+                        cockpit.spawn(["dnf", "needs-restarting", "--services"], { err: "message", superuser: "require" }),
+                        // we can't get stdout for a failing process, thus needs script
+                        cockpit.script("! dnf needs-restarting --reboothint", undefined, { err: "message", superuser: "require" }),
+                    ])
+                            .then(([serviceResult, rebootResult]) => {
+                                // --services format: one unit name per line
+                                if (serviceResult.status == 'fulfilled') {
+                                    debug("dnf needs-restarting --services succeeded:", serviceResult.value);
+                                    serviceResult.value.trim()
+                                            .split("\n")
+                                            // HACK: https://issues.redhat.com/browse/RHEL-84657
+                                            .filter(line => line.endsWith(".service"))
+                                            .forEach(line => restartPackages.daemons.push(line));
+                                } else {
+                                    console.error("dnf needs-restarting --services failed:", JSON.stringify(serviceResult.reason));
+                                }
+
+                                // --reboothint format: "  * kernel-rt" plus header/footer; exit nonzero iff reboot required, inverted above
+                                if (rebootResult.status == 'fulfilled') {
+                                    debug("dnf needs-restarting --reboothint exited nonzero, wants reboot:", rebootResult.value);
+                                    rebootResult.value.split("\n").forEach(line => {
+                                        if (line.startsWith("  * "))
+                                            restartPackages.reboot.push(line.substring(4));
+                                    });
+                                } else {
+                                    debug("dnf needs-restarting --reboothint exited zero, no reboot");
+                                }
+
+                                debug("dnf needs-restarting parsed packages:", JSON.stringify(restartPackages));
+                                this.setState({ checkRestartAvailable: true, checkRestartRunning: false, restartPackages });
+                            });
+                })
+                .catch(ex => {
+                    // log the error except for some common cases: no dnf
+                    if (ex.problem !== "not-found" &&
+                        // plugin does not support --exclude-services
+                        !ex.message.includes("usage:") &&
+                        // polkit does not allow it
+                        ex.problem !== "access-denied" &&
+                        // or unprivileged session
+                        ex.problem !== "authentication-failed" &&
+                        // or the session goes away while checking
+                        ex.problem !== "terminated")
+                        console.error("dnf needs-restarting failed:", ex.toString());
+
+                    // act like it's not available (demand reboot after every update)
+                    this.setState({ checkRestartAvailable: false, checkRestartRunning: false, restartPackages });
                 });
     }
 
@@ -1286,7 +1359,8 @@ class OsUpdates extends React.Component {
                                            if (exit === PK.Enum.EXIT_SUCCESS) {
                                                if (this.state.checkRestartAvailable) {
                                                    this.setState({ state: "loading", loadPercent: null });
-                                                   this.checkNeedsRestart("updateSuccess");
+                                                   this.checkNeedsRestart()
+                                                           .finally(() => this.setState({ state: "updateSuccess" }));
                                                } else {
                                                    this.setState({ state: "updateSuccess", loadPercent: null });
                                                }
@@ -1294,7 +1368,7 @@ class OsUpdates extends React.Component {
                                            } else if (exit === PK.Enum.EXIT_CANCELLED) {
                                                if (this.state.checkRestartAvailable) {
                                                    this.setState({ state: "loading", loadPercent: null });
-                                                   this.checkNeedsRestart(null);
+                                                   this.checkNeedsRestart();
                                                }
                                                this.loadUpdates();
                                            } else {
@@ -1466,7 +1540,7 @@ class OsUpdates extends React.Component {
                             restartPackages={this.state.restartPackages}
                             close={() => this.setState({ showRestartServicesDialog: false })}
                             state={this.state.state}
-                            checkNeedsRestart={state => this.checkNeedsRestart(state)}
+                            checkNeedsRestart={this.checkNeedsRestart}
                             onValueChanged={delta => this.setState(delta)}
                             loadUpdates={this.loadUpdates} />
                     }
@@ -1559,7 +1633,7 @@ class OsUpdates extends React.Component {
                         <RestartServices restartPackages={this.state.restartPackages}
                             close={() => this.setState({ showRestartServicesDialog: false })}
                             state={this.state.state}
-                            checkNeedsRestart={(state) => this.checkNeedsRestart(state)}
+                            checkNeedsRestart={this.checkNeedsRestart}
                             onValueChanged={delta => this.setState(delta)}
                             loadUpdates={this.loadUpdates} />
                     }
@@ -1594,7 +1668,7 @@ class OsUpdates extends React.Component {
                     <RestartServices restartPackages={this.state.restartPackages}
                                      close={() => this.setState({ showRestartServicesDialog: false })}
                                      state={this.state.state}
-                                     checkNeedsRestart={state => this.checkNeedsRestart(state)}
+                                     checkNeedsRestart={this.checkNeedsRestart}
                                      onValueChanged={delta => this.setState(delta)}
                                      loadUpdates={this.loadUpdates} />
                     }
